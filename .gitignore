@@ -1,0 +1,13 @@
+Release/
+Debug/
+unused/
+*.blend
+*.exe
+*.idb
+*.iobj
+*.ipdb
+*.log
+*.pdb
+*.recipe
+*.stl
+*.tlog
