@@ -1,0 +1,7 @@
+/thearray/git/NeighborlyPolyhedra/build/CMakeFiles/NeighborlyPolyhedra.dir
+/thearray/git/NeighborlyPolyhedra/build/CMakeFiles/edit_cache.dir
+/thearray/git/NeighborlyPolyhedra/build/CMakeFiles/rebuild_cache.dir
+/thearray/git/NeighborlyPolyhedra/build/CMakeFiles/list_install_components.dir
+/thearray/git/NeighborlyPolyhedra/build/CMakeFiles/install.dir
+/thearray/git/NeighborlyPolyhedra/build/CMakeFiles/install/local.dir
+/thearray/git/NeighborlyPolyhedra/build/CMakeFiles/install/strip.dir

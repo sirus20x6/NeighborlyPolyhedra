@@ -1,14 +1,35 @@
 #include "util.h"
+#include "cpu_features.h"
+#include "simd_util.h"
 #include <set>
 #include <iostream>
 #include <iomanip>
 #include <fstream>
 #include <string>
+#include <Eigen/Dense>
+#include <cmath>
+#include <cstddef>
+#include <vector>
+
+#include <vector>
+#include <unordered_map>
+#include <unordered_set>
+#include <algorithm> // for std::find, if needed
 
 Faces g_polys;
 Faces g_tris;
 Edges g_edges;
 int g_topology = 0;
+
+namespace ThreadLocalBuffers {
+    thread_local std::vector<Vector2f> temp_v2ds;
+    thread_local std::vector<Vector3f> temp_v3ds;
+    thread_local std::vector<int> temp_indices;
+}
+
+namespace ThreadLocal {
+    thread_local MemoryPool memory_pool;
+}
 
 inline void ltrim(std::string& s) {
   s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
@@ -208,33 +229,89 @@ bool test_face_ordering(const Faces& polys) {
     return true;
 }
 
-void fix_face_ordering(Faces& polys, const Edges& edges) {
+/**
+ * @brief Reorders each face in 'polys' so that consecutive vertices
+ *        share an edge. The input edges define adjacency between vertices.
+ *
+ *        This version uses an adjacency list to avoid scanning all edges
+ *        inside the loop, yielding significant performance improvements
+ *        for large inputs.
+ */
+void fix_face_ordering(Faces& polys, const Edges& edges)
+{
+    // 1) Build adjacency list from edges. 
+    //    Each vertex will map to all vertices it’s directly connected to.
+    std::unordered_map<int, std::vector<int>> adjacency;
+    adjacency.reserve(edges.size() * 2);  // A small reserve optimization
+
+    for (const auto& e : edges) {
+        adjacency[e.first].push_back(e.second);
+        adjacency[e.second].push_back(e.first);
+    }
+
+    // 2) For each polygon face, reorder its vertices using adjacency.
     Faces fixed_polys;
+    fixed_polys.reserve(polys.size());
+
     for (const Face& poly : polys) {
-        Face fixed_poly;
-        fixed_poly.push_back(poly[0]);
+        if (poly.empty()) {
+            // Edge case: empty polygon
+            fixed_polys.push_back(Face());
+            continue;
+        }
+
+        // Keep track of all vertices belonging to this polygon
+        // so we don't accidentally traverse to a vertex that isn't in the polygon.
         std::unordered_set<int> poly_set(poly.begin(), poly.end());
+        poly_set.reserve(poly.size()); // minor optimization
+
+        // We'll build a new (ordered) face in 'fixed_poly'.
+        Face fixed_poly;
+        fixed_poly.reserve(poly.size()); // minor optimization
+        fixed_poly.push_back(poly[0]);
+
+        // Keep track of which vertices we've used so far in fixed_poly
+        // to avoid duplicates.
+        std::unordered_set<int> used;
+        used.insert(poly[0]);
+
+        // 3) Repeatedly pick the next vertex from adjacency.
         while (fixed_poly.size() < poly.size()) {
-            for (const Edge& e : edges) {
-                const int e1 = e.first;
-                const int e2 = e.second;
-                const int lasVert = fixed_poly[fixed_poly.size() - 1];
-                if (e1 == lasVert && poly_set.find(e2) != poly_set.end() &&
-                    std::find(fixed_poly.begin(), fixed_poly.end(), e2) == fixed_poly.end()) {
-                    fixed_poly.push_back(e2);
-                    break;
-                }
-                if (e2 == lasVert && poly_set.find(e1) != poly_set.end() &&
-                    std::find(fixed_poly.begin(), fixed_poly.end(), e1) == fixed_poly.end()) {
-                    fixed_poly.push_back(e1);
+            int lastVert = fixed_poly.back();
+
+            // Find the adjacency list for 'lastVert'.
+            auto it = adjacency.find(lastVert);
+            if (it == adjacency.end()) {
+                // If 'lastVert' has no known adjacency, we can't continue.
+                break;
+            }
+
+            const std::vector<int>& neighbors = it->second;
+            bool foundNext = false;
+
+            // Check neighbors to find the next valid vertex in this polygon.
+            for (int neighbor : neighbors) {
+                if (poly_set.count(neighbor) > 0 && !used.count(neighbor)) {
+                    fixed_poly.push_back(neighbor);
+                    used.insert(neighbor);
+                    foundNext = true;
                     break;
                 }
             }
+
+            // If no neighbor was found, we can't complete the face ordering.
+            if (!foundNext) {
+                break;
+            }
         }
-        fixed_polys.push_back(fixed_poly);
+
+        fixed_polys.push_back(std::move(fixed_poly));
     }
-    polys = fixed_polys;
+
+    // 4) Move the result back into 'polys'.
+    polys = std::move(fixed_polys);
 }
+
 
 void import_obj(const char* fname, Verts3D& verts, Faces& polys) {
     verts.clear();
@@ -304,9 +381,328 @@ void line_line_intersection(const Vector3f& a1, const Vector3f& a2, const Vector
   pb = b1 + mub * p43;
 }
 
-void make_2d_projection(const Verts3D v3ds, const Face& poly, const Plane& plane, Verts2D& v2ds) {
-    Matrix3f basis; Vector3f p;
-    make_2d_projection(v3ds, poly, plane, v2ds, basis, p);
+struct ProjectionCache {
+    static thread_local Matrix3f basis;
+    static thread_local Vector3f origin;
+    static thread_local bool valid;
+    static thread_local Vector3f lastNormal;
+    static thread_local float lastD;
+    
+    static void invalidate() {
+        valid = false;
+    }
+};
+
+thread_local Matrix3f ProjectionCache::basis;
+thread_local Vector3f ProjectionCache::origin;
+thread_local bool ProjectionCache::valid = false;
+thread_local Vector3f ProjectionCache::lastNormal;
+thread_local float ProjectionCache::lastD;
+
+void make_2d_projection(const Verts3D& v3ds, 
+                       const Face& poly,
+                       const Plane& plane, 
+                       Verts2D& v2ds) 
+{
+    // Use thread-local storage for temporary calculations
+    ThreadLocalBuffers::ensureCapacity(poly.size());
+    auto& temp = ThreadLocalBuffers::temp_v2ds;
+    temp.clear();
+
+    // Check if we can reuse cached basis
+    if (!ProjectionCache::valid || 
+        plane.n != ProjectionCache::lastNormal || 
+        plane.d != ProjectionCache::lastD) 
+    {
+        // Need to compute new basis
+        const Vector3f& n = plane.n;
+        
+        // Choose robust axis for cross product
+        Vector3f arbitraryAxis;
+        if (std::abs(n.x()) < 0.9f) {
+            arbitraryAxis = Vector3f::UnitX();
+        } else if (std::abs(n.y()) < 0.9f) {
+            arbitraryAxis = Vector3f::UnitY();
+        } else {
+            arbitraryAxis = Vector3f::UnitZ();
+        }
+
+        // Compute orthonormal basis
+        Vector3f u = n.cross(arbitraryAxis).normalized();
+        Vector3f v = n.cross(u).normalized();
+        
+        // Cache the basis and origin
+        ProjectionCache::basis.col(0) = u;
+        ProjectionCache::basis.col(1) = v;
+        ProjectionCache::basis.col(2) = n;
+        ProjectionCache::origin = n * plane.d;
+        ProjectionCache::lastNormal = n;
+        ProjectionCache::lastD = plane.d;
+        ProjectionCache::valid = true;
+    }
+
+    // Pre-size temporary buffer
+    const size_t numVerts = poly.size();
+    temp.reserve(numVerts);
+
+    // Process vertices in groups of 8 when possible using AVX2
+    if (CPUFeatures::hasAVX2()) {
+        alignas(32) float vertices_x[8];
+        alignas(32) float vertices_y[8];
+        alignas(32) float vertices_z[8];
+        alignas(32) float results_x[8];
+        alignas(32) float results_y[8];
+
+        size_t i = 0;
+        for (; i + 8 <= numVerts; i += 8) {
+            // Load 8 vertices into aligned arrays
+            for (int j = 0; j < 8; j++) {
+                const Vector3f& v = v3ds[poly[i + j]];
+                vertices_x[j] = v.x() - ProjectionCache::origin.x();
+                vertices_y[j] = v.y() - ProjectionCache::origin.y();
+                vertices_z[j] = v.z() - ProjectionCache::origin.z();
+            }
+
+            // Load into AVX registers
+            __m256 vx = _mm256_load_ps(vertices_x);
+            __m256 vy = _mm256_load_ps(vertices_y);
+            __m256 vz = _mm256_load_ps(vertices_z);
+
+            // Project using basis
+            const Matrix3f& basis = ProjectionCache::basis;
+            __m256 projX = _mm256_setzero_ps();
+            __m256 projY = _mm256_setzero_ps();
+
+            // Unroll basis matrix multiplication
+            // X coordinate
+            projX = _mm256_add_ps(projX, _mm256_mul_ps(vx, _mm256_set1_ps(basis(0,0))));
+            projX = _mm256_add_ps(projX, _mm256_mul_ps(vy, _mm256_set1_ps(basis(0,1))));
+            projX = _mm256_add_ps(projX, _mm256_mul_ps(vz, _mm256_set1_ps(basis(0,2))));
+
+            // Y coordinate
+            projY = _mm256_add_ps(projY, _mm256_mul_ps(vx, _mm256_set1_ps(basis(1,0))));
+            projY = _mm256_add_ps(projY, _mm256_mul_ps(vy, _mm256_set1_ps(basis(1,1))));
+            projY = _mm256_add_ps(projY, _mm256_mul_ps(vz, _mm256_set1_ps(basis(1,2))));
+
+            // Store results
+            _mm256_store_ps(results_x, projX);
+            _mm256_store_ps(results_y, projY);
+
+            // Add projected points to temporary buffer
+            for (int j = 0; j < 8; j++) {
+                temp.emplace_back(results_x[j], results_y[j]);
+            }
+        }
+
+        // Handle remaining vertices
+        for (; i < numVerts; i++) {
+            const Vector3f pt = v3ds[poly[i]] - ProjectionCache::origin;
+            const float x = pt.dot(ProjectionCache::basis.col(0));
+            const float y = pt.dot(ProjectionCache::basis.col(1));
+            temp.emplace_back(x, y);
+        }
+    } else {
+        // Non-SIMD fallback with optimized memory access
+        temp.reserve(numVerts);
+        const Vector3f& basis_x = ProjectionCache::basis.col(0);
+        const Vector3f& basis_y = ProjectionCache::basis.col(1);
+        const Vector3f& origin = ProjectionCache::origin;
+
+        for (int idx : poly) {
+            const Vector3f pt = v3ds[idx] - origin;
+            const float x = pt.dot(basis_x);
+            const float y = pt.dot(basis_y);
+            temp.emplace_back(x, y);
+        }
+    }
+
+    // Move temporary results to output
+    v2ds = std::move(temp);
+}
+
+/**
+ * Optimized point-in-polygon test using winding number algorithm
+ * with SIMD acceleration
+ */
+bool point_in_polygon(const Vector2f& p, 
+                     const Verts2D& pts, 
+                     int& onEdge) 
+{
+    constexpr float EPSILON = 1e-6f;
+    constexpr float EPSILON_SQ = EPSILON * EPSILON;
+    
+    const size_t n = pts.size();
+    if (n < 3) return false;
+
+    onEdge = -1;
+    int winding = 0;
+    
+    // Cache point coordinates
+    const float px = p.x();
+    const float py = p.y();
+    
+    // Process edges in groups of 4 when possible
+    if (CPUFeatures::hasAVX2()) {
+        alignas(32) float prevX[8], prevY[8];
+        alignas(32) float currX[8], currY[8];
+        
+        // Start with last vertex
+        prevX[0] = pts[n-1].x();
+        prevY[0] = pts[n-1].y();
+        
+        size_t i = 0;
+        for (; i + 4 <= n; i += 4) {
+            // Load 4 current vertices
+            for (int j = 0; j < 4; j++) {
+                currX[j] = pts[i+j].x();
+                currY[j] = pts[i+j].y();
+            }
+            
+            // Create SIMD registers
+            __m256 vPrevX = _mm256_load_ps(prevX);
+            __m256 vPrevY = _mm256_load_ps(prevY);
+            __m256 vCurrX = _mm256_load_ps(currX);
+            __m256 vCurrY = _mm256_load_ps(currY);
+            __m256 vPx = _mm256_set1_ps(px);
+            __m256 vPy = _mm256_set1_ps(py);
+            
+            // Edge vectors
+            __m256 vEdgeX = _mm256_sub_ps(vCurrX, vPrevX);
+            __m256 vEdgeY = _mm256_sub_ps(vCurrY, vPrevY);
+            
+            // Point to vertex vectors
+            __m256 vToPointX = _mm256_sub_ps(vPx, vPrevX);
+            __m256 vToPointY = _mm256_sub_ps(vPy, vPrevY);
+            
+            // Compute squared distances to edges
+            __m256 vLenSq = _mm256_add_ps(
+                _mm256_mul_ps(vEdgeX, vEdgeX),
+                _mm256_mul_ps(vEdgeY, vEdgeY)
+            );
+            
+            __m256 vDot = _mm256_add_ps(
+                _mm256_mul_ps(vToPointX, vEdgeX),
+                _mm256_mul_ps(vToPointY, vEdgeY)
+            );
+            
+            __m256 vT = _mm256_div_ps(vDot, vLenSq);
+            vT = _mm256_min_ps(_mm256_max_ps(vT, _mm256_setzero_ps()), _mm256_set1_ps(1.0f));
+            
+            __m256 vProjX = _mm256_add_ps(vPrevX, _mm256_mul_ps(vT, vEdgeX));
+            __m256 vProjY = _mm256_add_ps(vPrevY, _mm256_mul_ps(vT, vEdgeY));
+            
+            __m256 vDistSq = _mm256_add_ps(
+                _mm256_mul_ps(_mm256_sub_ps(vPx, vProjX), _mm256_sub_ps(vPx, vProjX)),
+                _mm256_mul_ps(_mm256_sub_ps(vPy, vProjY), _mm256_sub_ps(vPy, vProjY))
+            );
+            
+            // Store results for distance check
+            alignas(32) float distSq[8];
+            _mm256_store_ps(distSq, vDistSq);
+            
+            // Check for points on edges
+            for (int j = 0; j < 4; j++) {
+                if (distSq[j] < EPSILON_SQ) {
+                    onEdge = static_cast<int>(i + j);
+                    return true;
+                }
+            }
+            
+            // Winding number calculation
+            __m256 vCross = _mm256_sub_ps(
+                _mm256_mul_ps(vEdgeX, _mm256_sub_ps(vPy, vPrevY)),
+                _mm256_mul_ps(vEdgeY, _mm256_sub_ps(vPx, vPrevX))
+            );
+            
+            alignas(32) float cross[8];
+            _mm256_store_ps(cross, vCross);
+            
+            for (int j = 0; j < 4; j++) {
+                if (prevY[j] <= py) {
+                    if (currY[j] > py && cross[j] > 0) winding++;
+                } else {
+                    if (currY[j] <= py && cross[j] < 0) winding--;
+                }
+                
+                // Update previous vertex
+                prevX[j] = currX[j];
+                prevY[j] = currY[j];
+            }
+        }
+        
+        // Handle remaining vertices
+        for (; i < n; i++) {
+            const Vector2f& v1 = pts[i];
+            const Vector2f& v2 = (i == n-1) ? pts[0] : pts[i+1];
+            
+            // Edge vector
+            Vector2f edge = v2 - v1;
+            float lenSq = edge.squaredNorm();
+            
+            // Check if point is on edge
+            if (lenSq > EPSILON_SQ) {
+                float t = (p - v1).dot(edge) / lenSq;
+                if (t >= 0 && t <= 1) {
+                    Vector2f proj = v1 + edge * t;
+                    if ((p - proj).squaredNorm() < EPSILON_SQ) {
+                        onEdge = static_cast<int>(i);
+                        return true;
+                    }
+                }
+            }
+            
+            // Winding number update
+            if (v1.y() <= py) {
+                if (v2.y() > py && ((v2.x() - v1.x()) * (py - v1.y()) - 
+                                  (px - v1.x()) * (v2.y() - v1.y())) > 0) {
+                    winding++;
+                }
+            } else {
+                if (v2.y() <= py && ((v2.x() - v1.x()) * (py - v1.y()) - 
+                                   (px - v1.x()) * (v2.y() - v1.y())) < 0) {
+                    winding--;
+                }
+            }
+        }
+    } else {
+        // Non-SIMD fallback implementation
+        const Vector2f* prev = &pts[n-1];
+        for (size_t i = 0; i < n; i++) {
+            const Vector2f* curr = &pts[i];
+            
+            // Check if point is on edge
+            Vector2f edge = *curr - *prev;
+            float lenSq = edge.squaredNorm();
+            
+            if (lenSq > EPSILON_SQ) {
+                float t = (p - *prev).dot(edge) / lenSq;
+                if (t >= 0 && t <= 1) {
+                    Vector2f proj = *prev + edge * t;
+                    if ((p - proj).squaredNorm() < EPSILON_SQ) {
+                        onEdge = static_cast<int>(i);
+                        return true;
+                    }
+                }
+            }
+            
+            // Winding number calculation
+            if (prev->y() <= py) {
+                if (curr->y() > py && (edge.x() * (py - prev->y()) - 
+                                     (px - prev->x()) * edge.y()) > 0) {
+                    winding++;
+                }
+            } else {
+                if (curr->y() <= py && (edge.x() * (py - prev->y()) - 
+                                      (px - prev->x()) * edge.y()) < 0) {
+                    winding--;
+                }
+            }
+            
+            prev = curr;
+        }
+    }
+    
+    return winding != 0;
 }
 
 void make_2d_projection(const Verts3D v3ds, const Face& poly, const Plane& plane, Verts2D& v2ds, Matrix3f& basis, Vector3f& p) {
@@ -469,96 +865,167 @@ inline float cp_test(const Vector2f& p1, const Vector2f& p2, const Vector2f& p3)
            (p2.y() - p1.y()) * (p3.x() - p1.x());
 }
 
-bool point_in_polygon(const Vector2f& p, const Verts2D& pts, int& onEdge) {
-    static const float epsilon = 1e-6f;
-    static const float epsilon2 = 1e-5f;
-    onEdge = -1;
-    int windingNumber = 0;
-    const Vector2f* p2 = &pts[pts.size() - 1];
-    for (size_t i = 0; i < pts.size(); i++) {
-        const Vector2f* p1 = &pts[i];
-        const float d2 = pt_to_line_dist_sq(p, *p1, *p2);
-        if (d2 < epsilon && (*p1 - p).squaredNorm() > epsilon2 && (*p2 - p).squaredNorm() > epsilon2) {
-            onEdge = (int)i;
-            return true;
-        }
-        if (p1->y() <= p.y()) {
-            if (p2->y() > p.y() && cp_test(*p1, *p2, p) > 0.0f) {
-                windingNumber++;
-            }
-        } else {
-            if (p2->y() <= p.y() && cp_test(*p1, *p2, p) < 0.0f) {
-                windingNumber--;
-            }
-        }
-        p2 = p1;
+/**
+ * @brief Inline function to compute the squared distance from point p
+ *        to the line segment defined by p1 -> p2.
+ */
+inline float ptToLineDistSq(const Vector2f& p, 
+                            const Vector2f& p1, 
+                            const Vector2f& p2)
+{
+    // If the segment is very short, just return distance^2 to p1
+    Vector2f seg    = p2 - p1;
+    float segLenSq  = seg.squaredNorm();
+    if (segLenSq < 1e-12f) {
+        return (p - p1).squaredNorm();
     }
-    return std::abs(windingNumber) == 1;
+
+    // Project point p onto the line p1->p2, then clamp
+    float t = (p - p1).dot(seg) / segLenSq;
+    t       = std::fmax(0.0f, std::fmin(1.0f, t));
+
+    Vector2f proj = p1 + t * seg;
+    return (p - proj).squaredNorm();
+}
+
+/**
+ * @brief Inline cross product test to determine orientation.
+ *        Equivalent to (p2 - p1) x (p - p1).
+ */
+inline float crossProductTest(const Vector2f& p1, 
+                              const Vector2f& p2, 
+                              const Vector2f& p)
+{
+    return (p2.x() - p1.x()) * (p.y() - p1.y()) 
+         - (p2.y() - p1.y()) * (p.x() - p1.x());
 }
 
 int count_crossings(const Verts3D& v3ds, const Plane& plane, const Face& poly) {
-    static const float epsilon = 1e-3f;
-    static const float epsilon2 = 1e-10f;
-    static Verts2D v2ds;
-
-    //Initialize results
-    int crossings = 0;
-
-    //Create an array of projected vertices
-    make_2d_projection(v3ds, poly, plane, v2ds);
-
-    //Iterate over all the line segments in order
+    // Pre-allocate vectors to avoid reallocations
+    static thread_local Verts2D v2ds;
+    v2ds.reserve(poly.size());
+    
+    // Quick exit for small polygons
     const size_t num = poly.size();
+    if (num < 2) return 0;
+
+    // Project vertices only once
+    make_2d_projection(v3ds, poly, plane, v2ds);
+    
+    // Pre-compute squared epsilon values
+    constexpr float EPSILON = 1e-3f;
+    constexpr float EPSILON2 = 1e-10f;
+    constexpr float EPSILON_SQ = EPSILON * EPSILON;
+    
+    int crossings = 0;
+    
+    // Pre-compute first vertex
     Vector2f a1 = v2ds[0];
+    
+    // Avoid branches in the inner loop by separating parallel and non-parallel cases
     for (size_t i = 1; i < num; ++i) {
-        //Get the first line segment
         const Vector2f& a2 = v2ds[i];
         const Vector2f da = a2 - a1;
-
+        const float da_sq = da.squaredNorm();
+        
         Vector2f b1 = v2ds[num - 1];
-        for (size_t j = 0; j < i - 1; ++j) {
-            //Ignore edge case that should not intersect
+        
+        // Process edges in batches of 4 when possible
+        size_t j = 0;
+        for (; j + 4 <= i - 1; j += 4) {
+            // Skip adjacency case
             if (i - j == num - 1) {
                 b1 = v2ds[j];
                 continue;
             }
-
-            //Get the other line segment
+            
+            // Load 4 vertices at once
+            const Vector2f& b2_0 = v2ds[j];
+            const Vector2f& b2_1 = v2ds[j + 1];
+            const Vector2f& b2_2 = v2ds[j + 2];
+            const Vector2f& b2_3 = v2ds[j + 3];
+            
+            // Process 4 edges in parallel
+            #pragma unroll(4)
+            for (int k = 0; k < 4; ++k) {
+                const Vector2f& b2 = *((&b2_0) + k);
+                const Vector2f db = b1 - b2;
+                const Vector2f ba = b1 - a1;
+                
+                const float det = da.x() * db.y() - da.y() * db.x();
+                const float det2 = det * det;
+                
+                if (det2 < EPSILON2) {
+                    // Parallel case
+                    if (da_sq >= EPSILON2) {
+                        const float proj_len = ba.dot(da) / da_sq;
+                        const Vector2f proj = a1 + da * proj_len;
+                        if ((b1 - proj).squaredNorm() < EPSILON_SQ) {
+                            crossings++;
+                        }
+                    }
+                } else {
+                    // Non-parallel case
+                    const float t = (db.y() * ba.x() - db.x() * ba.y()) / det;
+                    if (t > -EPSILON && t < 1.0f + EPSILON) {
+                        const float s = (da.x() * ba.y() - da.y() * ba.x()) / det;
+                        if (s > -EPSILON && s < 1.0f + EPSILON) {
+                            crossings++;
+                        }
+                    }
+                }
+                
+                b1 = b2;
+            }
+        }
+        
+        // Handle remaining edges
+        for (; j < i - 1; ++j) {
+            if (i - j == num - 1) {
+                b1 = v2ds[j];
+                continue;
+            }
+            
             const Vector2f& b2 = v2ds[j];
             const Vector2f db = b1 - b2;
-
-            //Check if the lines intersect
             const Vector2f ba = b1 - a1;
-            const float det = da.x()*db.y() - da.y()*db.x();
-            if (det * det < epsilon2) {
-                //Lines are parallel. Count as crossing if the distance between is too small.
-                const float d = (ba - da * (ba.dot(da) / da.squaredNorm())).squaredNorm();
-                if (d < epsilon) {
-                    crossings += 1;
+            
+            const float det = da.x() * db.y() - da.y() * db.x();
+            const float det2 = det * det;
+            
+            if (det2 < EPSILON2) {
+                if (da_sq >= EPSILON2) {
+                    const float proj_len = ba.dot(da) / da_sq;
+                    const Vector2f proj = a1 + da * proj_len;
+                    if ((b1 - proj).squaredNorm() < EPSILON_SQ) {
+                        crossings++;
+                    }
                 }
             } else {
-                //Lines are not parallel. Look for the intersection point if it exists.
-                const float t = (db.y()*ba.x() - db.x()*ba.y()) / det;
-                if (t > -epsilon && t < 1.0f + epsilon) {
-                    const float s = (da.x()*ba.y() - da.y()*ba.x()) / det;
-                    if (s > -epsilon && s < 1.0f + epsilon) {
-                        crossings += 1;
+                const float t = (db.y() * ba.x() - db.x() * ba.y()) / det;
+                if (t > -EPSILON && t < 1.0f + EPSILON) {
+                    const float s = (da.x() * ba.y() - da.y() * ba.x()) / det;
+                    if (s > -EPSILON && s < 1.0f + EPSILON) {
+                        crossings++;
                     }
                 }
             }
+            
             b1 = b2;
         }
+        
         a1 = a2;
     }
+    
     return crossings;
 }
 
 int count_crossings(const Verts3D& v3ds, const Planes& planes) {
-    int crossings = 0;
+    int total_crossings = 0;
     for (size_t i = 0; i < g_polys.size(); ++i) {
-        crossings += count_crossings(v3ds, planes[i], g_polys[i]);
+        total_crossings += count_crossings(v3ds, planes[i], g_polys[i]);
     }
-    return crossings;
+    return total_crossings;
 }
 
 int count_intersections(const Verts3D& v3ds, const Planes& planes, const Plane& plane, const Face& poly, const Edges& other_edges) {

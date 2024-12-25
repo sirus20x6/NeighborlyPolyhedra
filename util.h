@@ -4,6 +4,7 @@
 #include <unordered_set>
 #include <vector>
 #include <map>
+#include "memory_pool.h"
 
 using Eigen::Vector2f;
 using Eigen::Vector3f;
@@ -23,6 +24,9 @@ using Edges = std::vector<Edge>;
 using FaceMap = std::map<int, std::vector<int>>;
 using EdgeMap = std::map<Edge, std::vector<int>>;
 
+using Vector2f = Eigen::Vector2f;
+using Verts2D  = std::vector<Vector2f>;
+
 std::vector<std::string> split(const std::string& s, char delim);
 bool is_finite(const Verts3D& verts);
 void print_faces(const Faces& faces);
@@ -40,7 +44,7 @@ void export_obj(const char* fname, const Verts3D& verts, const Faces& polys);
 void line_line_intersection(const Vector3f& a1, const Vector3f& a2, const Vector3f& b1, const Vector3f& b2, Vector3f& pa, Vector3f& pb);
 
 Plane get_plane(const Verts3D& pts, const Face& poly);
-void make_2d_projection(const Verts3D v3ds, const Face& poly, const Plane& plane, Verts2D& v2ds);
+void make_2d_projection(const Verts3D& v3ds, const Face& poly, const Plane& plane, Verts2D& v2ds);
 void make_2d_projection(const Verts3D v3ds, const Face& poly, const Plane& plane, Verts2D& v2ds, Matrix3f& basis, Vector3f& p);
 Vector3f plane_intersection(const Plane& p1, const Plane& p2, const Plane& p3);
 void spread_planes(VectorXf& x, float spread, int iters);
@@ -92,3 +96,42 @@ extern Faces g_polys;
 extern Faces g_tris;
 extern Edges g_edges;
 extern int g_topology;
+
+namespace ThreadLocalBuffers {
+    extern thread_local std::vector<Vector2f> temp_v2ds;
+    extern thread_local std::vector<Vector3f> temp_v3ds;
+    extern thread_local std::vector<int> temp_indices;
+    
+    inline void ensureCapacity(size_t n) {
+        if (temp_v2ds.capacity() < n) temp_v2ds.reserve(n * 2);
+        if (temp_v3ds.capacity() < n) temp_v3ds.reserve(n * 2);
+        if (temp_indices.capacity() < n) temp_indices.reserve(n * 2);
+    }
+}
+
+namespace ThreadLocal {
+    extern thread_local MemoryPool memory_pool;
+}
+
+// Custom allocator using the pool
+template<typename T>
+class PoolAllocator {
+public:
+    using value_type = T;
+    
+    PoolAllocator() noexcept {}
+    
+    template<typename U>
+    PoolAllocator(const PoolAllocator<U>&) noexcept {}
+    
+    T* allocate(size_t n) {
+        return static_cast<T*>(ThreadLocal::memory_pool.allocate(n * sizeof(T)));
+    }
+    
+    void deallocate(T* p, size_t n) {
+        ThreadLocal::memory_pool.deallocate(p, n * sizeof(T));
+    }
+};
+
+// Use the pool allocator with vectors
+using PoolVector2f = std::vector<Vector2f, PoolAllocator<Vector2f>>;

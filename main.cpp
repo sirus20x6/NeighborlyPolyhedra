@@ -1,6 +1,10 @@
 //#define USE_CAIRO
+#include <format>
+#include <termcolor/termcolor.hpp>
 #include "util.h"
+#include "simd_util.h"
 #include "solver.h"
+#include "cpu_features.h"
 #include <iostream>
 #include <sstream>
 #include <fstream>
@@ -12,6 +16,11 @@
 
 #define NUM_TOPOLOGIES 59
 #define DUAL_PROBLEM 0
+
+// Define static members of CPUFeatures
+bool CPUFeatures::initialized = false;
+bool CPUFeatures::has_sse2 = false;
+bool CPUFeatures::has_avx2 = false;
 
 #ifdef USE_CAIRO
 void render_cutout(const Verts3D& v3ds, const Planes& planes, int width) {
@@ -79,6 +88,197 @@ void render_cutout(const Verts3D& v3ds, const Planes& planes, int width) {
     cairo_surface_destroy(surface);
 }
 #endif
+
+void validate_crossings(const Verts3D& v3ds, const Plane& plane, const Face& poly) {
+    static const float epsilon = 1e-3f;
+    static const float epsilon2 = 1e-10f;
+    static Verts2D v2ds;
+    
+    make_2d_projection(v3ds, poly, plane, v2ds);
+    
+    std::cout << "\nDebug Output:\n";
+    std::cout << "2D Projected vertices:\n";
+    for (size_t i = 0; i < v2ds.size(); i++) {
+        std::cout << "  v" << i << ": " << v2ds[i].transpose() << "\n";
+    }
+
+    // Get results from both implementations with debug info
+    bool avx2_status = CPUFeatures::has_avx2;
+    
+    // First run SIMD version
+    CPUFeatures::has_avx2 = true;
+    std::cout << "\nSIMD Version Calculations:\n";
+    int simd_result = simd::count_crossings_simd(v3ds, plane, poly);
+    
+    // Then run scalar version
+    CPUFeatures::has_avx2 = false;
+    std::cout << "\nScalar Version Calculations:\n";
+    int scalar_result = count_crossings(v3ds, plane, poly);
+    
+    // Restore AVX2 status
+    CPUFeatures::has_avx2 = avx2_status;
+    
+    if (simd_result != scalar_result) {
+        std::cout << "\nMismatch detected!\n";
+        std::cout << "Case details:\n";
+        std::cout << "Vertices:\n";
+        for (size_t i = 0; i < v3ds.size(); i++) {
+            std::cout << "  v" << i << ": " << v3ds[i].transpose() << "\n";
+        }
+        std::cout << "Plane: normal=" << plane.n.transpose() << ", d=" << plane.d << "\n";
+        std::cout << "Face: ";
+        for (int idx : poly) std::cout << idx << " ";
+        std::cout << "\n";
+        std::cout << "SIMD result: " << simd_result << "\n";
+        std::cout << "Scalar result: " << scalar_result << "\n";
+        throw std::runtime_error("SIMD/Scalar mismatch in crossing detection");
+    }
+}
+
+void run_crossing_tests() {
+    std::cout << "Running crossing detection tests...\n";
+    
+    // Test 1: Simple planar triangle
+    {
+        std::cout << "Test 1: Simple planar triangle... ";
+        Verts3D verts = {
+            Vector3f(0,0,0),
+            Vector3f(1,0,0),
+            Vector3f(0,1,0)
+        };
+        Face poly = {0,1,2};
+        Plane plane(Vector3f(0,0,1), 0);
+        validate_crossings(verts, plane, poly);
+        std::cout << "PASSED\n";
+    }
+
+    // Test 2: Self-intersecting polygon
+    {
+        std::cout << "Test 2: Self-intersecting polygon... ";
+        Verts3D verts = {
+            Vector3f(0,0,0),
+            Vector3f(1,0,0),
+            Vector3f(0,1,0),
+            Vector3f(1,1,0),
+            Vector3f(0.5,0.5,0)
+        };
+        Face poly = {0,1,3,2};
+        Plane plane(Vector3f(0,0,1), 0);
+        validate_crossings(verts, plane, poly);
+        std::cout << "PASSED\n";
+    }
+
+    // Test 3: Near-parallel lines
+    {
+        std::cout << "Test 3: Near-parallel lines... ";
+        Verts3D verts = {
+            Vector3f(0,0,0),
+            Vector3f(1,0.001,0),
+            Vector3f(0,1,0),
+            Vector3f(1,1.001,0)
+        };
+        Face poly = {0,1,3,2};
+        Plane plane(Vector3f(0,0,1), 0);
+        validate_crossings(verts, plane, poly);
+        std::cout << "PASSED\n";
+    }
+
+    // Test 4: Near-touching lines
+    {
+        std::cout << "Test 4: Near-touching lines... ";
+        Verts3D verts = {
+            Vector3f(0,0,0),
+            Vector3f(1,0,0),
+            Vector3f(0.5,0.001,0),
+            Vector3f(0.5,-0.001,0)
+        };
+        Face poly = {0,1,2,3};
+        Plane plane(Vector3f(0,0,1), 0);
+        validate_crossings(verts, plane, poly);
+        std::cout << "PASSED\n";
+    }
+
+    // Test 5: Rotated polygon
+    {
+        std::cout << "Test 5: Rotated polygon... ";
+        Verts3D verts = {
+            Vector3f(0,0,0),
+            Vector3f(1,0,1),
+            Vector3f(0,1,1),
+            Vector3f(1,1,0)
+        };
+        Face poly = {0,1,3,2};
+        Plane plane(Vector3f(1,1,1).normalized(), 0.5);
+        validate_crossings(verts, plane, poly);
+        std::cout << "PASSED\n";
+    }
+
+      {
+        std::cout << "Test 6: Epsilon distance case... ";
+        const float eps = 1e-3f;  // Matches epsilon in implementation
+        Verts3D verts = {
+            Vector3f(0,0,0),
+            Vector3f(1,0,0),
+            Vector3f(0.5,eps/2,0),
+            Vector3f(0.5,-eps/2,0)
+        };
+        Face poly = {0,1,2,3};
+        Plane plane(Vector3f(0,0,1), 0);
+        validate_crossings(verts, plane, poly);
+        std::cout << "PASSED\n";
+    }
+
+    // Test 7: Multiple parallel lines
+    {
+        std::cout << "Test 7: Multiple parallel lines... ";
+        const float eps = 1e-6f;
+        Verts3D verts = {
+            Vector3f(0,0,0),
+            Vector3f(1,eps,0),
+            Vector3f(0,0.1,0),
+            Vector3f(1,0.1+eps,0)
+        };
+        Face poly = {0,1,2,3};
+        Plane plane(Vector3f(0,0,1), 0);
+        validate_crossings(verts, plane, poly);
+        std::cout << "PASSED\n";
+    }
+
+    // Test 8: Almost parallel lines
+    {
+        std::cout << "Test 8: Almost parallel lines... ";
+        Verts3D verts = {
+            Vector3f(0,0,0),
+            Vector3f(1,1e-5,0),
+            Vector3f(0,0.1,0),
+            Vector3f(1,0.1-1e-5,0)
+        };
+        Face poly = {0,1,2,3};
+        Plane plane(Vector3f(0,0,1), 0);
+        validate_crossings(verts, plane, poly);
+        std::cout << "PASSED\n";
+    }
+
+    // Test 9: Star pattern (multiple crossings)
+    {
+        std::cout << "Test 9: Star pattern... ";
+        Verts3D verts = {
+            Vector3f(0,0,0),
+            Vector3f(1,0,0),
+            Vector3f(0.5,1,0),
+            Vector3f(0,0.5,0),
+            Vector3f(1,0.5,0)
+        };
+        Face poly = {0,1,2,3,4};
+        Plane plane(Vector3f(0,0,1), 0);
+        validate_crossings(verts, plane, poly);
+        std::cout << "PASSED\n";
+    }
+
+    // Add more test cases as needed...
+
+    std::cout << "All crossing detection tests passed!\n";
+}
 
 void validate_files(bool change_files=true) {
     for (int i = 0; i < NUM_TOPOLOGIES; ++i) {
@@ -312,20 +512,37 @@ void explore_shape(const char* load_fname) {
 #endif
 }
 
+
+
+
 int main(int argc, char* argv[]) {
-    //validate_files(true);
-    //return 0;
+    std::cout << termcolor::cyan << "Starting the application...\n" << termcolor::reset;
+
+    std::cout << termcolor::yellow
+              << std::format("CPU Features: SSE2: {} AVX2: {}\n",
+                             (CPUFeatures::hasSSE2() ? "Yes" : "No"),
+                             (CPUFeatures::hasAVX2() ? "Yes" : "No"))
+              << termcolor::reset;
+
+    if (argc > 1 && std::string(argv[1]) == "--test") {
+        std::cout << termcolor::green << "Running crossing tests in debug mode...\n" << termcolor::reset;
+        g_debug_mode = true;
+        run_crossing_tests();
+    }
 
     int seed = 123;
-    std::cout << "Seed: ";
+    std::cout << termcolor::blue << "Enter seed value: " << termcolor::reset;
     std::cin >> seed;
-    std::cout << std::endl;
+    std::cout << termcolor::cyan << std::format("Seed set to: {}\n", seed) << termcolor::reset;
     set_rand_seed(seed);
 
-    //Run the optimizer (choose one)
+    std::cout << termcolor::green << "Starting main solver...\n" << termcolor::reset;
     main_solver();
-    //quality_solver();
-    //explore_shape("../Szilassi/topology_42/shape_c0_i4_optimalsymmetric.obj");
 
+    // Uncomment if using other solvers
+    // quality_solver();
+    // explore_shape("../Szilassi/topology_42/shape_c0_i4_optimalsymmetric.obj");
+
+    std::cout << termcolor::cyan << "Application finished successfully.\n" << termcolor::reset;
     return 0;
 }
